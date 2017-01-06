@@ -26,6 +26,11 @@ import struct
 import base64
 import datetime
 import random
+from itertools import cycle
+try:
+    from itertools import izip
+except ImportError:
+    izip = zip
 
 from shadowsocks import common
 from shadowsocks.obfsplugin import plain
@@ -40,6 +45,9 @@ def create_http_post_obfs(method):
 def create_random_head_obfs(method):
     return random_head(method)
 
+def create_websockets_obfs(method):
+    return websockets(method)
+
 obfs_map = {
         'http_simple': (create_http_simple_obfs,),
         'http_simple_compatible': (create_http_simple_obfs,),
@@ -47,6 +55,7 @@ obfs_map = {
         'http_post_compatible': (create_http_post_obfs,),
         'random_head': (create_random_head_obfs,),
         'random_head_compatible': (create_random_head_obfs,),
+	'websockets': (create_websockets_obfs,),
 }
 
 def match_begin(str1, str2):
@@ -253,6 +262,195 @@ class http_post(http_simple):
         self.has_sent_header = True
         self.has_recv_header = True
         if self.method == 'http_post':
+            return (b'E'*2048, False, False)
+        return (buf, True, False)
+
+class websockets(http_simple):
+    def __init__(self, method):
+        self.has_sent_handshake = False
+        self.has_recv_handshake = False
+        self.incomplete_data_frame = False
+        self.send_buffer = b""
+        super(websockets, self).__init__(method)
+
+    def client_encode(self, buf):
+        if self.has_sent_handshake and not self.has_recv_handshake:
+            self.send_buffer += buf
+            return b""
+        if self.has_recv_handshake:
+            if self.send_buffer:
+                buf = self.send_buffer + buf
+                self.send_buffer = b""
+            return self.construct_data_frame(buf, True)
+        head_size = len(self.server_info.iv) + self.server_info.head_len
+        if len(buf) - head_size > 64:
+            headlen = head_size + random.randint(0, 64)
+        else:
+            headlen = len(buf)
+        headdata = buf[:headlen]
+        buf = buf[headlen:]
+        port = b''
+        if self.server_info.port != 80:
+            port = b':' + to_bytes(str(self.server_info.port))
+        body = None
+        hosts = (self.server_info.obfs_param or self.server_info.host)
+        pos = hosts.find("#")
+        if pos >= 0:
+            body = hosts[pos + 1:].replace("\\n", "\r\n")
+            hosts = hosts[:pos]
+        hosts = hosts.split(',')
+        host = random.choice(hosts)
+        http_head = b"GET /" + self.encode_head(headdata) + b" HTTP/1.1\r\n"
+        http_head += b"Host: " + to_bytes(host) + port + b"\r\n"
+
+        if body:
+            http_head += body + "\r\n"
+
+        http_head += b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        http_head += b"Sec-WebSocket-Version: 13\r\n"
+        data = binascii.b2a_base64(buf)
+        data = data[:- 1]
+        http_head += b"Sec-WebSocket-Key: " + data + b"\r\n\r\n"
+        self.has_sent_handshake = True
+        return http_head
+
+    def client_decode(self, buf):
+        if self.has_recv_handshake:
+            return (self.unpack_data_frame(buf, True), False)
+        self.recv_buffer += buf
+        buf = self.recv_buffer
+        if b"Sec-WebSocket-Accept: " in buf:
+            data = buf.split(b"Sec-WebSocket-Accept: ", 1)[1]
+            if b"\r\n" not in data:
+                return (b"", False)
+            self.has_recv_handshake = True
+            data = data.split(b"\r\n")[0]
+            data = binascii.a2b_base64(data)
+            if self.send_buffer:
+                return (data, True)
+            return (data, False)
+        return (b"", False)
+
+    def construct_data_frame(self, buf, is_client):
+        frame = b"\x82"
+        mask = 128 if is_client else 0
+        if len(buf) <= 125:
+            mask += len(buf)
+            frame += chr(mask)
+        elif len(buf) <= 65535:
+            mask += 126
+            frame += chr(mask)
+            frame += struct.pack(">H", len(buf))
+        elif len(buf) <= 9223372036854775807:
+            mask += 127
+            frame += chr(mask)
+            frame += struct.pack(">Q", len(buf))
+        if is_client:
+            key = struct.pack(">I", random.randint(0, 4294967295))
+            frame += key
+            frame += self.sxor(buf, key)
+        else:
+            frame += buf
+        return frame
+
+    def unpack_data_frame(self, buf, is_client):
+        if not self.incomplete_data_frame and ((len(buf) < 3 and is_client) or (len(buf) < 7 and not is_client)):
+            return b""
+        data_start_pos = 2 if is_client else 6
+        if self.incomplete_data_frame:
+            buf = self.recv_buffer + buf
+        payload_length = ord(buf[1]) if is_client else ord(buf[1]) - 128
+        if payload_length == 126:
+            data_start_pos += 2
+            payload_length = struct.unpack(">H", buf[2:4])[0]
+        elif payload_length == 127:
+            data_start_pos += 8
+            payload_length = struct.unpack(">Q", buf[2:10])[0]
+        if len(buf[data_start_pos:]) > payload_length:
+            self.incomplete_data_frame = False
+            data = buf[data_start_pos:data_start_pos + payload_length]
+            if not is_client:
+                key = buf[data_start_pos - 4:data_start_pos]
+                data = self.sxor(data, key)
+            data += self.unpack_data_frame(buf[data_start_pos + payload_length:], is_client)
+            return data
+        elif len(buf[data_start_pos:]) < payload_length:
+            self.incomplete_data_frame = True
+            self.recv_buffer = buf
+            return b""
+        data = buf[data_start_pos:]
+        if not is_client:
+            key = buf[data_start_pos - 4: data_start_pos]
+            data = self.sxor(data, key)
+        self.incomplete_data_frame = False
+        return data
+
+    def sxor(self, message, key):
+        message = bytearray(message)
+        key = bytearray(key)
+        result = bytearray()
+        for x,y in izip(message, cycle(key)):
+            result.append(x ^ y)
+        return bytes(result)
+
+    def server_encode(self, buf):
+        if self.has_sent_handshake:
+            return self.construct_data_frame(buf, False)
+        http_head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        data = binascii.b2a_base64(buf)
+        data = data[:- 1]
+        http_head += b"Sec-WebSocket-Accept: " + data + b"\r\n\r\n"
+        self.has_sent_handshake = True
+        return http_head
+
+    def server_decode(self, buf):
+        if self.has_sent_handshake:
+            return (self.unpack_data_frame(buf, False), True, False)
+
+        self.recv_buffer += buf
+        buf = self.recv_buffer
+        if len(buf) > 10:
+            if match_begin(buf, b"GET "):
+                if len(buf) > 65536:
+                    self.recv_buffer = None
+                    logging.warn("websockets: over size")
+                    return self.not_match_return(buf)
+            else: #not http header, run on original protocol
+                self.recv_buffer = None
+                logging.debug("websockets: not match begin")
+                return self.not_match_return(buf)
+        else:
+            return (b'', True, False)
+        if b"Sec-WebSocket-Key: " in buf:
+            data = buf.split(b"Sec-WebSocket-Key: ", 1)[1]
+            if b"\r\n" not in data:
+                return (b"", True, False)
+            data = data.split(b"\r\n", 1)[0]
+            data = binascii.a2b_base64(data)
+
+            ret_buf = self.get_data_from_http_header(buf)
+            host = self.get_host_from_http_header(buf)
+
+            if host and self.server_info.obfs_param:
+                pos = host.find(":")
+                if pos >= 0:
+                    host = host[:pos]
+                hosts = self.server_info.obfs_param.split(',')
+                if host not in hosts:
+                    return self.not_match_return(buf)
+            if len(ret_buf) < 4:
+                return self.not_match_return(buf)
+            ret_buf += data
+            if len(ret_buf) >= 7:
+                self.has_recv_handshake = True
+                return (ret_buf, True, False)
+            return self.not_match_return(buf)
+        else:
+            return (b'', True, False)
+
+    def not_match_return(self, buf):
+        self.has_recv_handshake = True
+        if self.method == 'websockets':
             return (b'E'*2048, False, False)
         return (buf, True, False)
 
